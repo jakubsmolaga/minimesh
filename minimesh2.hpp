@@ -13,7 +13,7 @@ namespace minimesh
     using TransmitFunc = auto(ConstBytes bytes) -> void;
     using SleepFunc = auto(uint32_t duration_us) -> void;
     using IsChannelBusyFunc = auto() -> bool;
-    using CollectorCallback = auto(Id device_id, const Bytes data) -> void;
+    using CollectorCallback = auto(Id device_id, ConstBytes data) -> void;
     constexpr CollectorCallback *no_callback =
         reinterpret_cast<CollectorCallback *>(NULL);
 
@@ -35,9 +35,9 @@ namespace minimesh
             }
         }
 
-        auto get_data_buffer() -> uint8_t *
+        auto get_data_buffer() const -> uint8_t *
         {
-            static_assert(is_collector, "data buffer is only used for sensors");
+            static_assert(!is_collector, "data buffer is only used for sensors");
             return data_packet->data;
         }
 
@@ -101,8 +101,8 @@ namespace minimesh
         };
         enum Result
         {
-            Ok,
             Fail,
+            Ok,
         };
         Packet *data_packet = []()
         {
@@ -125,21 +125,25 @@ namespace minimesh
             auto child_count = count_children();
             while (child_count > 0)
             {
-                const auto [packet, length] = receive_packet(100);
+                const auto [packet, length] = receive_packet(5000);
                 if (length == 0)
                     return;
-                if (packet.receiver_id != id)
+                if (packet->receiver_id != id)
                     continue;
-                if (packet.MsgType == MsgType::EndOfData)
-                    child_count--;
-                if (packet.MsgType == MsgType::Data)
+                if (packet->msg_type == MsgType::EndOfData)
                 {
-                    collector_callback(packet.data);
-                    send_ack(packet.transmitter_id);
+                    child_count--;
+                    send_ack(packet->transmitter_id);
+                }
+
+                if (packet->msg_type == MsgType::Data)
+                {
+                    collector_callback(packet->transmitter_id, {reinterpret_cast<uint8_t *>(packet),
+                                                                length});
+                    send_ack(packet->transmitter_id);
                 }
             }
         }
-        // Done
         auto find_parent() const -> Id
         {
             auto packet_wrapper = receive_packet(0);
@@ -147,21 +151,26 @@ namespace minimesh
             if (packet->msg_type != MsgType::IAmParent)
                 return find_parent(); // try again
             const auto parent_id = packet->transmitter_id;
-            packet->receiver_id = parent_id;
-            packet->transmitter_id = id;
-            packet->msg_type = MsgType::IAmChild;
-            if (deliver(packet_wrapper))
+            const Packet i_am_child = {
+                MsgType::IAmChild,
+                id,
+                parent_id,
+            };
+            const ConstPacketWrapper i_am_child_wrapper = {
+                &i_am_child,
+                header_size,
+            };
+            if (deliver(i_am_child_wrapper))
                 return parent_id;
             return find_parent(); // try again
         }
-        // Done
         auto count_children() const -> uint32_t
         {
             transmit_i_am_parent();
             auto child_count = 0;
             while (true)
             {
-                const auto [packet, length] = receive_packet(50);
+                const auto [packet, length] = receive_packet(100);
                 if (length == 0)
                     return child_count;
                 if (packet->receiver_id == id && packet->msg_type == MsgType::IAmChild)
@@ -171,14 +180,12 @@ namespace minimesh
                 }
             }
         }
-
-        // Done
         auto proxy_children(Id parent_id,
                             uint32_t child_count) const -> void
         {
             if (child_count == 0)
                 return;
-            auto [packet, length] = receive_packet(300);
+            auto [packet, length] = receive_packet(5000);
             if (length == 0)
                 return;
             if (packet->receiver_id != id)
@@ -192,8 +199,6 @@ namespace minimesh
             deliver({packet,
                      length});
         }
-
-        // Done
         auto deliver(ConstPacketWrapper packet_wrapper) const -> Result
         {
             for (auto attempts = 0; attempts < 10; attempts++)
@@ -211,7 +216,7 @@ namespace minimesh
         {
             for (auto attempts = 0; attempts < 3; attempts++)
             {
-                const auto [packet, length] = receive_packet(50);
+                const auto [packet, length] = receive_packet(10);
                 if (length == 0)
                     continue;
                 const auto is_receiver_ok = packet->receiver_id == id;
@@ -225,7 +230,7 @@ namespace minimesh
         };
         auto transmit_i_am_parent() const -> void
         {
-            static constexpr Header packet = {
+            const Header packet = {
                 MsgType::IAmParent,
                 id,
                 broadcast,
@@ -253,7 +258,7 @@ namespace minimesh
         }
         auto send_ack(Id receiver_id) const -> void
         {
-            static Header packet = {
+            Header packet = {
                 MsgType::Ack,
                 id,
                 0,
@@ -265,20 +270,18 @@ namespace minimesh
         }
         auto receive_packet(uint32_t timeout) const -> PacketWrapper
         {
-            return bytes_to_packet(receive(timeout));
+            const auto [buffer, length] = receive(timeout);
+            return {reinterpret_cast<Packet *>(buffer), length};
         }
         auto transmit_packet(ConstPacketWrapper packet) const -> void
         {
-            return transmit(*reinterpret_cast<ConstBytes *>(&packet));
-        }
-        static constexpr auto bytes_to_packet(Bytes bytes) -> PacketWrapper
-        {
-            return *reinterpret_cast<PacketWrapper *>(&bytes);
-        }
-        static constexpr auto packet_to_bytes(PacketWrapper packet) -> Bytes
-        {
-            return *reinterpret_cast<Bytes *>(&packet);
+            const ConstBytes bytes = {
+                reinterpret_cast<const uint8_t *>(packet.packet),
+                packet.length,
+            };
+            return transmit(bytes);
         }
     };
-};
+}
+
 #endif
